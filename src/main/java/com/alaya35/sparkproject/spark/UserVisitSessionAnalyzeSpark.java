@@ -27,6 +27,8 @@ import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.hive.HiveContext;
 
 import org.apache.spark.storage.StorageLevel;
+import parquet.it.unimi.dsi.fastutil.ints.IntArrayList;
+import parquet.it.unimi.dsi.fastutil.ints.IntList;
 import scala.Tuple2;
 
 import com.alibaba.fastjson.JSONObject;
@@ -76,10 +78,15 @@ public class UserVisitSessionAnalyzeSpark {
 		//   alaya35-Ar-6 使用Kryo序列化 //
 		SparkConf conf = new SparkConf()
 				.setAppName(Constants.SPARK_APP_NAME_SESSION)
+				.set("spark.storage.memoryFraction", "0.5")  //	/  alaya35-Ar-9
+				.set("spark.shuffle.consolidateFiles", "true")   //	/  alaya35-Ar-10
+				.set("spark.shuffle.file.buffer", "64")     //	/  alaya35-Ar-11
+				.set("spark.shuffle.memoryFraction", "0.3")    //	/  alaya35-Ar-12
 				.setMaster("local")
 				.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
 				.registerKryoClasses(new Class[]{
-						CategorySortKey.class});
+						CategorySortKey.class
+						,IntList.class}); //alaya35-Ar-7-4 使用fastutil优化数据格式
 		/**  alaya35-Ar-6-1
 		 * 比如，获取top10热门品类功能中，二次排序，自定义了一个Key
 		 * 那个key是需要在进行shuffle的时候，进行网络传输的，因此也是要求实现序列化的
@@ -1020,16 +1027,46 @@ public class UserVisitSessionAnalyzeSpark {
 		}
 
 
+
+
+/**   alaya35-Ar-7
+		 * fastutil的使用，很简单，比如List<Integer>的list，对应到fastutil，就是IntList
+		 */
+		Map<String, Map<String, IntList>> fastutilDateHourExtractMap =
+				new HashMap<String, Map<String, IntList>>();
+
+		for(Map.Entry<String, Map<String, List<Integer>>> dateHourExtractEntry : dateHourExtractMap.entrySet()) {
+			String date = dateHourExtractEntry.getKey();
+			Map<String, List<Integer>> hourExtractMap = dateHourExtractEntry.getValue();
+			// alaya35-Ar-7-1
+			Map<String, IntList> fastutilHourExtractMap = new HashMap<String, IntList>();
+
+			for(Map.Entry<String, List<Integer>> hourExtractEntry : hourExtractMap.entrySet()) {
+				String hour = hourExtractEntry.getKey();
+				List<Integer> extractList = hourExtractEntry.getValue();
+				// alaya35-Ar-7-2
+				IntList fastutilExtractList = new IntArrayList();
+
+				for(int i = 0; i < extractList.size(); i++) {
+					fastutilExtractList.add(extractList.get(i));
+				}
+
+				fastutilHourExtractMap.put(hour, fastutilExtractList);
+			}
+
+			fastutilDateHourExtractMap.put(date, fastutilHourExtractMap);
+		}
+
+
 		/**   alaya35-Ar-5-2
 		 * 广播变量，很简单
 		 * 其实就是SparkContext的broadcast()方法，传入你要广播的变量，即可
 		 */
-		final Broadcast<Map<String, Map<String, List<Integer>>>> dateHourExtractMapBroadcast =
-				sc.broadcast(dateHourExtractMap);
-//		final Broadcast<Map<String, Map<String, IntList>>> dateHourExtractMapBroadcast =
-//				sc.broadcast(fastutilDateHourExtractMap);
-
-
+//		final Broadcast<Map<String, Map<String, List<Integer>>>> dateHourExtractMapBroadcast =
+//				sc.broadcast(dateHourExtractMap);
+		//alaya35-Ar-7-3
+		final Broadcast<Map<String, Map<String, IntList>>> dateHourExtractMapBroadcast =
+				sc.broadcast(fastutilDateHourExtractMap);
 
 		/**
 		 * 第三步：遍历每天每小时的session，然后根据随机索引进行抽取
