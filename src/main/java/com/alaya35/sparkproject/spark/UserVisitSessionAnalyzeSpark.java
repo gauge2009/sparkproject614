@@ -12,6 +12,7 @@ import com.alaya35.sparkproject.dao.*;
 import com.alaya35.sparkproject.domain.*;
 import com.alaya35.sparkproject.util.*;
 import com.google.common.base.Optional;
+import org.apache.hadoop.yarn.webapp.hamlet.HamletSpec;
 import org.apache.spark.Accumulator;
 import org.apache.spark.SparkConf;
 import org.apache.spark.SparkContext;
@@ -19,11 +20,13 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.*;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.DataFrame;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SQLContext;
 import org.apache.spark.sql.hive.HiveContext;
 
+import org.apache.spark.storage.StorageLevel;
 import scala.Tuple2;
 
 import com.alibaba.fastjson.JSONObject;
@@ -66,9 +69,25 @@ public class UserVisitSessionAnalyzeSpark {
 		  args = new String[]{"2"};
 		
 		// 构建Spark上下文
+
+//		SparkConf conf = new SparkConf()
+//				.setAppName(Constants.SPARK_APP_NAME_SESSION)
+//				.setMaster("local");
+		//   alaya35-Ar-6 使用Kryo序列化 //
 		SparkConf conf = new SparkConf()
 				.setAppName(Constants.SPARK_APP_NAME_SESSION)
-				.setMaster("local");    
+				.setMaster("local")
+				.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+				.registerKryoClasses(new Class[]{
+						CategorySortKey.class});
+		/**  alaya35-Ar-6-1
+		 * 比如，获取top10热门品类功能中，二次排序，自定义了一个Key
+		 * 那个key是需要在进行shuffle的时候，进行网络传输的，因此也是要求实现序列化的
+		 * 启用Kryo机制以后，就会用Kryo去序列化和反序列化CategorySortKey
+		 * 所以这里要求，为了获取最佳性能，注册一下我们自定义的类
+		 */
+
+
 		JavaSparkContext sc = new JavaSparkContext(conf);
 		SQLContext sqlContext = getSQLContext(sc.sc());
 		
@@ -85,11 +104,41 @@ public class UserVisitSessionAnalyzeSpark {
 		
 		// 如果要进行session粒度的数据聚合
 		// 首先要从user_visit_action表中，查询出来指定日期范围内的行为数据
+		/**
+		 * //   alaya35-Ar-1 //
+		 * actionRDD，就是一个公共RDD
+		 * 第一，要用ationRDD，获取到一个公共的sessionid为key的PairRDD
+		 * 第二，actionRDD，用在了session聚合环节里面
+		 *
+		 * sessionid为key的PairRDD，是确定了，在后面要多次使用的
+		 * 1、与通过筛选的sessionid进行join，获取通过筛选的session的明细数据
+		 * 2、将这个RDD，直接传入aggregateBySession方法，进行session聚合统计
+		 *
+		 * 重构完以后，actionRDD，就只在最开始，使用一次，用来生成以sessionid为key的RDD
+		 *
+		 */
 		JavaRDD<Row> actionRDD = getActionRDDByDateRange(sqlContext, taskParam);
 
 
 		//   再进行session粒度的数据聚合
 		JavaPairRDD<String, Row> sessionid2actionRDD = getSessionid2ActionRDD(actionRDD);
+/**
+ * //   alaya35-Ar-2 //
+ * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
+ *
+ * 如果是persist(StorageLevel.MEMORY_ONLY())，纯内存，无序列化，那么就可以用cache()方法来替代
+ * StorageLevel.MEMORY_ONLY_SER()，第二选择
+ * StorageLevel.MEMORY_AND_DISK()，第三选择
+ * StorageLevel.MEMORY_AND_DISK_SER()，第四选择
+ * StorageLevel.DISK_ONLY()，第五选择
+ *
+ * 如果内存充足，要使用双副本高可靠机制
+ * 选择后缀带_2的策略
+ * StorageLevel.MEMORY_ONLY_2()
+ *
+ */
+		sessionid2actionRDD = sessionid2actionRDD.persist(StorageLevel.MEMORY_ONLY());
+//		sessionid2actionRDD.checkpoint();
 
 
 		// 首先，可以将行为数据，按照session_id进行groupByKey分组
@@ -97,7 +146,8 @@ public class UserVisitSessionAnalyzeSpark {
 		// 与用户信息数据，进行join
 		// 然后就可以获取到session粒度的数据，同时呢，数据里面还包含了session对应的user的信息
 		// 到这里为止，获取的数据是<sessionid,(sessionid,searchKeywords,clickCategoryIds,age,professional,city,sex)>  
-		JavaPairRDD<String, String> sessionid2AggrInfoRDD =  aggregateBySession(sqlContext, actionRDD);
+		//JavaPairRDD<String, String> sessionid2AggrInfoRDD =  aggregateBySession(sqlContext, actionRDD);
+		JavaPairRDD<String, String> sessionid2AggrInfoRDD = aggregateBySession(sc, sqlContext, sessionid2actionRDD);
 		//////测试
 		/*for(Tuple2<String,String> tuple : sessionid2AggrInfoRDD.take(10)){
 			System.out.println(tuple._2);
@@ -117,7 +167,11 @@ public class UserVisitSessionAnalyzeSpark {
 
 		JavaPairRDD<String, String> filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
 				sessionid2AggrInfoRDD, taskParam, sessionAggrStatAccumulator);
-
+		/**
+		 * //   alaya35-Ar-3 //
+		 * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
+		 */
+		filteredSessionid2AggrInfoRDD = filteredSessionid2AggrInfoRDD.persist(StorageLevel.MEMORY_ONLY());
 	 	/*//////测试
 		for(Tuple2<String,String> tuple : filteredSessionid2AggrInfoRDD.take(10)){
 			System.out.println(tuple._2);
@@ -127,9 +181,13 @@ public class UserVisitSessionAnalyzeSpark {
 		*/
 
 ////   1-2   // 重构一下之前的代码，将通过筛选条件的session的访问明细数据RDD，提取成公共的RDD；这样就不用重复计算同样的RDD
+ 	/**
+		 * 重构：sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
+		 */
 		JavaPairRDD<String, Row> sessionid2detailRDD = getSessionid2detailRDD(
 				filteredSessionid2AggrInfoRDD, sessionid2actionRDD);
-
+		//   alaya35-Ar-4 //
+		 sessionid2detailRDD = sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY());
 
 		/**
 		 * 对于Accumulator这种分布式累加计算的变量的使用，有一个重要说明
@@ -155,7 +213,7 @@ public class UserVisitSessionAnalyzeSpark {
 		//randomExtractSession(filteredSessionid2AggrInfoRDD);
 		//randomExtractSession(task.getTaskid(), filteredSessionid2AggrInfoRDD);
 //   2   //
-		randomExtractSession(task.getTaskid(),   filteredSessionid2AggrInfoRDD, sessionid2actionRDD);
+		randomExtractSession(sc ,  task.getTaskid(),   filteredSessionid2AggrInfoRDD, sessionid2actionRDD);
 
 		/**
 		 *    <N>   //特别说明
@@ -317,34 +375,44 @@ public class UserVisitSessionAnalyzeSpark {
 
 	/**
 	 * 对行为数据按session粒度进行聚合
-	 * @param actionRDD 行为数据RDD
+	 * @param sc
+	 *  @param sqlContext
+	 *   @param sessinoid2actionRDD 行为数据RDD
 	 * @return session粒度聚合数据
 	 */
+//	private static JavaPairRDD<String, String> aggregateBySession(
+//			SQLContext sqlContext, JavaRDD<Row> actionRDD) {
+//   alaya35-Ar-1-1 //
 	private static JavaPairRDD<String, String> aggregateBySession(
-			SQLContext sqlContext, JavaRDD<Row> actionRDD) {
-		// 现在actionRDD中的元素是Row，一个Row就是一行用户访问行为记录，比如一次点击或者搜索
-		// 我们现在需要将这个Row映射成<sessionid,Row>的格式
-		JavaPairRDD<String, Row> sessionid2ActionRDD = actionRDD.mapToPair(
-				
-				/**
-				 * PairFunction
-				 * 第一个参数，相当于是函数的输入
-				 * 第二个参数和第三个参数，相当于是函数的输出（Tuple），分别是Tuple第一个和第二个值
-				 */
-				new PairFunction<Row, String, Row>() {
+			JavaSparkContext sc,
+			SQLContext sqlContext,
+			JavaPairRDD<String, Row> sessinoid2actionRDD) {
 
-					private static final long serialVersionUID = 1L;
 
-					@Override
-					public Tuple2<String, Row> call(Row row) throws Exception {
-						return new Tuple2<String, Row>(row.getString(2), row);
-					}
-					
-				});
+		//   alaya35-Ar-1-2 //
+//		// 现在actionRDD中的元素是Row，一个Row就是一行用户访问行为记录，比如一次点击或者搜索
+//		// 我们现在需要将这个Row映射成<sessionid,Row>的格式
+//		JavaPairRDD<String, Row> sessionid2ActionRDD = actionRDD.mapToPair(
+//
+//				/**
+//				 * PairFunction
+//				 * 第一个参数，相当于是函数的输入
+//				 * 第二个参数和第三个参数，相当于是函数的输出（Tuple），分别是Tuple第一个和第二个值
+//				 */
+//				new PairFunction<Row, String, Row>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, Row> call(Row row) throws Exception {
+//						return new Tuple2<String, Row>(row.getString(2), row);
+//					}
+//
+//				});
 		
 		// 对行为数据按session粒度进行分组
-		JavaPairRDD<String, Iterable<Row>> sessionid2ActionsRDD = 
-				sessionid2ActionRDD.groupByKey();
+		JavaPairRDD<String, Iterable<Row>> sessionid2ActionsRDD =
+				sessinoid2actionRDD.groupByKey();
 		
 
 		// 对每一个session分组进行聚合，将session中所有的搜索词和点击品类都聚合起来
@@ -819,6 +887,7 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @param sessionid2AggrInfoRDD
 	 */
 	private static void randomExtractSession(
+			JavaSparkContext sc,  // alaya35-Ar-5-1
 			final long taskid,
 			JavaPairRDD<String, String> sessionid2AggrInfoRDD,
 			JavaPairRDD<String, Row> sessionid2actionRDD) {
@@ -883,8 +952,23 @@ public class UserVisitSessionAnalyzeSpark {
 		int extractNumberPerDay = 100 / dateHourCountMap.size();
 
 		// <date,<hour,(3,5,20,102)>>
-		final Map<String, Map<String, List<Integer>>> dateHourExtractMap =
-				new HashMap<String, Map<String, List<Integer>>>();
+
+		/**
+		 *  //       alaya35-Ar-5
+		 * session随机抽取功能
+		 *
+		 * 用到了一个比较大的变量，随机抽取索引map
+		 * 之前是直接在算子里面使用了这个map，那么根据我们刚才讲的这个原理，每个task都会拷贝一份map副本
+		 * 还是比较消耗内存和网络传输性能的
+		 *
+		 * 将map做成广播变量
+		 *
+		 */
+//		final Map<String, Map<String, List<Integer>>> dateHourExtractMap =
+//				new HashMap<String, Map<String, List<Integer>>>();
+
+		  Map<String, Map<String, List<Integer>>> dateHourExtractMap =
+ 			 new HashMap<String, Map<String, List<Integer>>>();
 
 		Random random = new Random();
 
@@ -935,6 +1019,18 @@ public class UserVisitSessionAnalyzeSpark {
 			}
 		}
 
+
+		/**   alaya35-Ar-5-2
+		 * 广播变量，很简单
+		 * 其实就是SparkContext的broadcast()方法，传入你要广播的变量，即可
+		 */
+		final Broadcast<Map<String, Map<String, List<Integer>>>> dateHourExtractMapBroadcast =
+				sc.broadcast(dateHourExtractMap);
+//		final Broadcast<Map<String, Map<String, IntList>>> dateHourExtractMapBroadcast =
+//				sc.broadcast(fastutilDateHourExtractMap);
+
+
+
 		/**
 		 * 第三步：遍历每天每小时的session，然后根据随机索引进行抽取
 		 */
@@ -966,7 +1062,15 @@ public class UserVisitSessionAnalyzeSpark {
 						String hour = dateHour.split("_")[1];
 						Iterator<String> iterator = tuple._2.iterator();
 
-						List<Integer> extractIndexList = dateHourExtractMap.get(date).get(hour);
+
+						// alaya35-Ar-5-3
+						/**
+						 * 使用广播变量的时候
+						 * 直接调用广播变量（Broadcast类型）的value() / getValue()
+						 * 可以获取到之前封装的广播变量
+						 */
+						//List<Integer> extractIndexList = dateHourExtractMap.get(date).get(hour);
+						List<Integer> extractIndexList = dateHourExtractMapBroadcast.value().get(date).get(hour);
 
 						ISessionRandomExtractDAO sessionRandomExtractDAO =
 								DAOFactory.getSessionRandomExtractDAO();
