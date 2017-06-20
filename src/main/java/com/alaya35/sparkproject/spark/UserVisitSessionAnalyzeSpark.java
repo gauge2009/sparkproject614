@@ -78,15 +78,24 @@ public class UserVisitSessionAnalyzeSpark {
 		//   alaya35-Ar-6 使用Kryo序列化 //
 		SparkConf conf = new SparkConf()
 				.setAppName(Constants.SPARK_APP_NAME_SESSION)
-				.set("spark.storage.memoryFraction", "0.5")  //	/  alaya35-Ar-9
-				.set("spark.shuffle.consolidateFiles", "true")   //	/  alaya35-Ar-10
-				.set("spark.shuffle.file.buffer", "64")     //	/  alaya35-Ar-11
-				.set("spark.shuffle.memoryFraction", "0.3")    //	/  alaya35-Ar-12
-				.setMaster("local")
+                //.set("spark.default.parallelism", "100")//       alaya35-Ar-18  算子调优之使用repartition解决Spark SQL低并行度的性能问题
+				.set("spark.storage.memoryFraction", "0.5")  //	/  alaya35-Ar-9 降低cache操作的内存占比
+				.set("spark.shuffle.consolidateFiles", "true")   //	/  alaya35-Ar-11    合并map端输出文件
+                .set("spark.shuffle.file.buffer", "64")     //       alaya35-Ar-12    map端内存缓冲
+                .set("spark.shuffle.memoryFraction", "0.3")    //       alaya35-Ar-13   调节reduce端内存占比
+                // 默认就是， .set("spark.shuffle.manager", "sort")//	/  alaya35-Ar-14 SortShuffleManager
+                .set("spark.reducer.maxSizeInFlight", "24")//       alaya35-Ar-20    troubleshooting之控制shuffle reduce端缓冲大小以避免OOM
+                .set("spark.shuffle.io.maxRetries", "60")//       alaya35-Ar-21troubleshooting之解决JVM GC导致的shuffle文件拉取失败
+                .set("spark.shuffle.io.retryWait", "60")//       alaya35-Ar-21troubleshooting之解决JVM GC导致的shuffle文件拉取失败
+                .setMaster("local")
 				.set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
 				.registerKryoClasses(new Class[]{
 						CategorySortKey.class
 						,IntList.class}); //alaya35-Ar-7-4 使用fastutil优化数据格式
+
+
+
+
 		/**  alaya35-Ar-6-1
 		 * 比如，获取top10热门品类功能中，二次排序，自定义了一个Key
 		 * 那个key是需要在进行shuffle的时候，进行网络传输的，因此也是要求实现序列化的
@@ -356,7 +365,19 @@ public class UserVisitSessionAnalyzeSpark {
 
 //        int count = actionDF.javaRDD().toArray().size();
 //		System.out.println("getActionRDDByDateRange:"+ count);
-		return actionDF.javaRDD();
+        /**
+         * //       alaya35-Ar-18  算子调优之使用repartition解决Spark SQL低并行度的性能问题
+
+         * 这里就很有可能发生上面说的问题
+         * 比如说，Spark SQl默认就给第一个stage设置了20个task，但是根据你的数据量以及算法的复杂度
+         * 实际上，你需要1000个task去并行执行
+         *
+         * 所以说，在这里，就可以对Spark SQL刚刚查询出来的RDD执行repartition重分区操作
+         */
+
+//		return actionDF.javaRDD().repartition(1000);
+
+        return actionDF.javaRDD();
 	}
 
 
@@ -367,16 +388,39 @@ public class UserVisitSessionAnalyzeSpark {
 	 * @return
 	 */
 	public static JavaPairRDD<String, Row> getSessionid2ActionRDD(JavaRDD<Row> actionRDD) {
-		return actionRDD.mapToPair(new PairFunction<Row, String, Row>() {
 
-			private static final long serialVersionUID = 1L;
+//		return actionRDD.mapToPair(new PairFunction<Row, String, Row>() {
+//
+//			private static final long serialVersionUID = 1L;
+//
+//			@Override
+//			public Tuple2<String, Row> call(Row row) throws Exception {
+//				return new Tuple2<String, Row>(row.getString(2), row);
+//			}
+//
+//		});
+        //       alaya35-Ar-15     算子调优之MapPartitions提升Map类操作性能
+        return  actionRDD.mapPartitionsToPair(new PairFlatMapFunction<Iterator<Row>, String, Row>() {
 
-			@Override
-			public Tuple2<String, Row> call(Row row) throws Exception {
-				return new Tuple2<String, Row>(row.getString(2), row);
-			}
+            private static final long serialVersionUID = 1L;
 
-		});
+            @Override
+            public Iterable<Tuple2<String, Row>> call(Iterator<Row> rowIterator) throws Exception {
+               //一次调用会处理完整个分区所有的数据，故传入的是 Row 的容器的迭代器
+                //Iterator<Row> rowIterator  ~   Row 的容器的迭代器
+                List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+
+                while(rowIterator.hasNext()) {
+                    Row row = rowIterator.next();
+                    list.add(new Tuple2<String, Row>(row.getString(2), row));
+                }
+
+                return list;
+            }
+        });
+
+
+
 	}
 
 
@@ -1149,34 +1193,74 @@ public class UserVisitSessionAnalyzeSpark {
 		 * 第四步：获取抽取出来的session的明细数据
 		 */
 		JavaPairRDD<String, Tuple2<String, Row>> extractSessionDetailRDD = extractSessionidsRDD .join(sessionid2actionRDD);
-		extractSessionDetailRDD .foreach(new VoidFunction<Tuple2<String,Tuple2<String,Row>>>() {
+//		extractSessionDetailRDD .foreach(new VoidFunction<Tuple2<String,Tuple2<String,Row>>>() {
+//
+//			private static final long serialVersionUID = 1L;
+//
+//			@Override
+//			public void call(Tuple2<String, Tuple2<String, Row>> tuple) throws Exception {
+//				Row row = tuple._2._2;
+//
+//
+//				SessionDetail sessionDetail = new SessionDetail();
+//				sessionDetail.setTaskid(taskid);
+//				sessionDetail.setUserid(row.getLong(1));
+//				sessionDetail.setSessionid(row.getString(2));
+//				sessionDetail.setPageid(row.getLong(3));
+//				sessionDetail.setActionTime(row.getString(4));
+//				sessionDetail.setSearchKeyword(row.getString(5));
+//				sessionDetail.setClickCategoryId(row.getLong(6));
+//				sessionDetail.setClickProductId(row.getLong(7));
+//				sessionDetail.setOrderCategoryIds(row.getString(8));
+//				sessionDetail.setOrderProductIds(row.getString(9));
+//				sessionDetail.setPayCategoryIds(row.getString(10));
+//				sessionDetail.setPayProductIds(row.getString(11));
+//
+//				ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
+//				sessionDetailDAO.insert(sessionDetail);
+//			}
+//		});
 
-			private static final long serialVersionUID = 1L;
+        //       alaya35-Ar-17   算子调优之使用foreachPartition优化写数据库性能
+        extractSessionDetailRDD.foreachPartition(
 
-			@Override
-			public void call(Tuple2<String, Tuple2<String, Row>> tuple) throws Exception {
-				Row row = tuple._2._2;
+                new VoidFunction<Iterator<Tuple2<String,Tuple2<String,Row>>>>() {
 
+                    private static final long serialVersionUID = 1L;
 
-				SessionDetail sessionDetail = new SessionDetail();
-				sessionDetail.setTaskid(taskid);
-				sessionDetail.setUserid(row.getLong(1));
-				sessionDetail.setSessionid(row.getString(2));
-				sessionDetail.setPageid(row.getLong(3));
-				sessionDetail.setActionTime(row.getString(4));
-				sessionDetail.setSearchKeyword(row.getString(5));
-				sessionDetail.setClickCategoryId(row.getLong(6));
-				sessionDetail.setClickProductId(row.getLong(7));
-				sessionDetail.setOrderCategoryIds(row.getString(8));
-				sessionDetail.setOrderProductIds(row.getString(9));
-				sessionDetail.setPayCategoryIds(row.getString(10));
-				sessionDetail.setPayProductIds(row.getString(11));
+                    @Override
+                    public void call(
+                            Iterator<Tuple2<String, Tuple2<String, Row>>> iterator)
+                            throws Exception {
+                        List<SessionDetail> sessionDetails = new ArrayList<SessionDetail>();
 
-				ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
-				sessionDetailDAO.insert(sessionDetail);
-			}
-		});
+                        while(iterator.hasNext()) {
+                            Tuple2<String, Tuple2<String, Row>> tuple = iterator.next();
 
+                            Row row = tuple._2._2;
+
+                            SessionDetail sessionDetail = new SessionDetail();
+                            sessionDetail.setTaskid(taskid);
+                            sessionDetail.setUserid(row.getLong(1));
+                            sessionDetail.setSessionid(row.getString(2));
+                            sessionDetail.setPageid(row.getLong(3));
+                            sessionDetail.setActionTime(row.getString(4));
+                            sessionDetail.setSearchKeyword(row.getString(5));
+                            sessionDetail.setClickCategoryId(row.getLong(6));
+                            sessionDetail.setClickProductId(row.getLong(7));
+                            sessionDetail.setOrderCategoryIds(row.getString(8));
+                            sessionDetail.setOrderProductIds(row.getString(9));
+                            sessionDetail.setPayCategoryIds(row.getString(10));
+                            sessionDetail.setPayProductIds(row.getString(11));
+
+                            sessionDetails.add(sessionDetail);
+                        }
+
+                        ISessionDetailDAO sessionDetailDAO = DAOFactory.getSessionDetailDAO();
+                        sessionDetailDAO.insertBatch(sessionDetails);
+                    }
+
+                });
 
 
 	}
@@ -1482,6 +1566,21 @@ public class UserVisitSessionAnalyzeSpark {
 	 */
 	private static JavaPairRDD<Long, Long> getClickCategoryId2CountRDD(
 			JavaPairRDD<String, Row> sessionid2detailRDD) {
+
+
+        /**
+
+         * alaya35-Ar-16   算子调优之filter过后使用coalesce减少分区数量
+         * 说明一下：
+         *
+         * 这儿，是对完整的数据进行了filter过滤，过滤出来点击行为的数据
+         * 点击行为的数据其实只占总数据的一小部分
+         * 所以过滤以后的RDD，每个partition的数据量，很有可能跟我们之前说的一样，会很不均匀
+         * 而且数据量肯定会变少很多
+         *
+         * 所以针对这种情况，还是比较合适用一下coalesce算子的，在filter过后去减少partition的数量
+         *
+         */
 		JavaPairRDD<String, Row> clickActionRDD = sessionid2detailRDD .filter(
 
 				new Function<Tuple2<String,Row>, Boolean>() {
@@ -1499,6 +1598,22 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 
 				});
+//				.coalesce(100);  //alaya35-Ar-16   算子调优之filter过后使用coalesce减少分区数量
+
+        /**
+         * 对这个coalesce操作做一个说明
+         *
+         * 我们在这里用的模式都是local模式，主要是用来测试，所以local模式下，不用去设置分区和并行度的数量
+         * local模式自己本身就是进程内模拟的集群来执行，本身性能就很高
+         * 而且对并行度、partition数量都有一定的内部的优化
+         *
+         * 这里我们再自己去设置，就有点画蛇添足
+         *
+         * 但是就是跟大家说明一下，coalesce算子的使用，即可
+         *
+         */
+
+
 
 		JavaPairRDD<Long, Long> clickCategoryIdRDD = clickActionRDD.mapToPair(
 
