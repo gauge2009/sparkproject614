@@ -105,6 +105,7 @@ public class UserVisitSessionAnalyzeSpark {
 
 
 		JavaSparkContext sc = new JavaSparkContext(conf);
+		//		sc.checkpointFile("hdfs://");//       alaya35-Ar-27  step1: troubleshooting之错误的持久化方式以及checkpoint的使用
 		SQLContext sqlContext = getSQLContext(sc.sc());
 		
 		// 生成模拟测试数据
@@ -138,6 +139,8 @@ public class UserVisitSessionAnalyzeSpark {
 
 		//   再进行session粒度的数据聚合
 		JavaPairRDD<String, Row> sessionid2actionRDD = getSessionid2ActionRDD(actionRDD);
+		// sessionid2actionRDD.checkpoint();//       alaya35-Ar-27 step2: troubleshooting之错误的持久化方式以及checkpoint的使用
+
 /**
  * //   alaya35-Ar-2 //
  * 持久化，很简单，就是对RDD调用persist()方法，并传入一个持久化级别
@@ -357,6 +360,7 @@ public class UserVisitSessionAnalyzeSpark {
 				+ "from user_visit_action "
 				+ "where date>='" + startDate + "' "
 				+ "and date<='" + endDate + "'";
+		//		+ "and session_id not in('','','')";  //       alaya35-Ar-30  过滤导致倾斜的key
 //		String sql =
 //				"select * "
 //						+ "from user_visit_action " ;
@@ -462,6 +466,12 @@ public class UserVisitSessionAnalyzeSpark {
 //				});
 		
 		// 对行为数据按session粒度进行分组
+
+		//       alaya35-Ar-29  聚合源数据
+//		对于我们的程序来说，完全可以将aggregateBySession()这一步操作，放在一个hive etl中来做，形成一个新的表。
+// 对每天的用户访问行为数据，都按session粒度进行聚合，写一个hive sql。 在spark程序中，就不要去做groupByKey+mapToPair这种算子了。
+// 直接从当天的session聚合表中，用Spark SQL查询出来对应的数据，即可。这个RDD在后面就可以使用了。
+
 		JavaPairRDD<String, Iterable<Row>> sessionid2ActionsRDD =
 				sessinoid2actionRDD.groupByKey();
 		
@@ -593,7 +603,15 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
-		
+
+		/**
+		 *         alaya35-Ar-33  数据倾斜解决方案之将reduce join转换为map join
+		 *这里就可以说一下，比较适合采用reduce join转换为map join的方式
+		 *
+		 * userid2PartAggrInfoRDD，可能数据量还是比较大，比如，可能在1千万数据
+		 * userid2InfoRDD，可能数据量还是比较小的，你的用户数量才10万用户
+		 *
+		 */
 		// 将session粒度聚合数据，与用户信息进行join
 		JavaPairRDD<Long, Tuple2<String, Row>> userid2FullInfoRDD = 
 				userid2PartAggrInfoRDD.join(userid2InfoRDD);
@@ -630,6 +648,336 @@ public class UserVisitSessionAnalyzeSpark {
 					}
 					
 				});
+
+
+		/**
+		 *        alaya35-Ar-33  reduce join转换为map join
+		 */
+/**
+ *        alaya35-Ar-33-  reduce join转换为map join
+ */
+
+//		List<Tuple2<Long, Row>> userInfos = userid2InfoRDD. collect();
+		// alaya35-Ar-33-1 将那个小RDD的数据 broadcast出去
+//		final Broadcast<List<Tuple2<Long, Row>>> userInfosBroadcast = sc. broadcast(userInfos);
+//
+//		JavaPairRDD<String, String> sessionid2FullAggrInfoRDD = userid2PartAggrInfoRDD. mapToPair(
+//
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						// 得到用户信息map
+//						List<Tuple2<Long, Row>> userInfos = userInfosBroadcast .value();
+//
+//						Map<Long, Row> userInfoMap = new HashMap<Long, Row>();
+//						for(Tuple2<Long, Row> userInfo : userInfos) {
+//							userInfoMap.put(userInfo._1, userInfo._2);
+//						}
+//
+//						// 获取到当前用户对应的信息
+//						String partAggrInfo = tuple._2;
+//						Row userInfoRow = userInfoMap .get(tuple._1);
+//
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//
+//				});
+
+
+		/**
+		 *         alaya35-Ar-34   数据倾斜解决方案之sample采样倾斜key单独进行join
+		 */
+		//        alaya35-Ar-34-1 采样10%，随机种子9
+//		JavaPairRDD<Long, String> sampledRDD = userid2PartAggrInfoRDD. sample(false, 0.1, 9);
+//
+//		JavaPairRDD<Long, Long> mappedSampledRDD = sampledRDD. mapToPair(
+//
+//				new PairFunction<Tuple2<Long,String>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						return new Tuple2<Long, Long>(tuple._1, 1L);
+//					}
+//
+//				});
+//		//        alaya35-Ar-34-2  发现导致数据倾斜的那个 key
+//			        alaya35-Ar-34-2-1    reduceByKey
+//		JavaPairRDD<Long, Long> computedSampledRDD = mappedSampledRDD .reduceByKey(
+//
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//
+//				});
+//		//        alaya35-Ar-34-2-2    反转
+//		JavaPairRDD<Long, Long> reversedSampledRDD = computedSampledRDD. mapToPair(
+//
+//				new PairFunction<Tuple2<Long,Long>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<Long, Long> tuple)
+//							throws Exception {
+//						return new Tuple2<Long, Long>(tuple._2, tuple._1);
+//					}
+//
+//				});
+//		//        alaya35-Ar-34-2-3    降序排序取到导致数据倾斜的那个 key
+//		final Long skewedUserid = reversedSampledRDD.  sortByKey(false).take(1).get(0)._2;
+//
+
+// //       alaya35-Ar-34-3  对原来的 RDD 进行拆分，得到两个 RDD ：skewedRDD、commonRDD
+//		JavaPairRDD<Long, String> skewedRDD = userid2PartAggrInfoRDD. filter(
+//
+//				new Function<Tuple2<Long,String>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Boolean call(Tuple2<Long, String> tuple) throws Exception {
+//						return tuple._1.equals(skewedUserid);
+//					}
+//
+//				});
+//
+//		JavaPairRDD<Long, String> commonRDD = userid2PartAggrInfoRDD.filter(
+//
+//				new Function<Tuple2<Long,String>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Boolean call(Tuple2<Long, String> tuple) throws Exception {
+//						return !tuple._1.equals(skewedUserid);
+//					}
+//
+//				});
+
+////////       alaya35-Ar-34-4   joinedRDD1
+////////JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD1 = skewedRDD. join(userid2InfoRDD);
+////////       alaya35-Ar-34-5   joinedRDD2
+////////	JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD2 = commonRDD. join(userid2InfoRDD);
+////////       alaya35-Ar-34-6  合并
+////////JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD = joinedRDD1. union(joinedRDD2);
+/* 咱们单拉出来了，一个或者少数几个可能会产生数据倾斜的key~joinedRDD1，然后还可以进行更加优化的一个操作；
+
+	对于那个key，从另外一个要join的表中，也过滤出来一份数据，比如可能就只有一条数据。userid2infoRDD，一个userid key，就对应一条数据。
+
+		然后呢，采取对那个只有一条数据的RDD，进行flatMap操作，打上100个随机数，作为前缀，返回100条数据。
+
+		单独拉出来的可能产生数据倾斜的RDD，给每一条数据，都打上一个100以内的随机数，作为前缀。
+
+		再去进行join，是不是性能就更好了。肯定可以将数据进行打散，去进行join。join完以后，可以执行map操作，去将之前打上的随机数，给去掉，然后再和另外一个普通RDD join以后的结果，进行union操作。
+*/
+//			//       alaya35-Ar-34-4-1 对于那个数据倾斜key，从另外一个要join的表中，也过滤出来一份数据
+//		JavaPairRDD<String, Row> skewedUserid2infoRDD = userid2InfoRDD. filter(
+//
+//				new Function<Tuple2<Long,Row>, Boolean>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Boolean call(Tuple2<Long, Row> tuple) throws Exception {
+//						return tuple._1.equals(skewedUserid);
+//					}
+//
+//				}). flatMapToPair(new PairFlatMapFunction<Tuple2<Long,Row>, String, Row>() {
+////       alaya35-Ar-34-4-2对那个只有一条数据的辅助RDD，进行flatMap操作，打上100个随机数，作为前缀，返回100条数据
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Iterable<Tuple2<String, Row>> call(
+//							Tuple2<Long, Row> tuple) throws Exception {
+//						Random random = new Random();
+//						List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+//
+//						for(int i = 0; i < 100; i++) {
+//							int prefix = random.nextInt(100);
+//							list.add(new Tuple2<String, Row>(prefix + "_" + tuple._1, tuple._2));
+//						}
+//
+//						return list;
+//					}
+//
+//				});
+//		//       alaya35-Ar-34-4-3  单独拉出来的可能产生数据倾斜的RDD，给每一条数据，都打上一个100以内的随机数，作为前缀。
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD1 = skewedRDD. mapToPair(
+//
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(100);
+//						return new Tuple2<String, String>(prefix + "_" + tuple._1, tuple._2);
+//					}
+//
+//				}).join(skewedUserid2infoRDD)//       alaya35-Ar-34-4-4 再去与辅助 RDD进行join，是不是性能就更好了。肯定可以将数据进行打散，去进行join。
+//				.mapToPair(
+//						//       alaya35-Ar-34-4-5 join完以后，可以执行map操作，去将之前打上的随机数，给去掉，
+//						new PairFunction<Tuple2<String,Tuple2<String,Row>>, Long, Tuple2<String, Row>>() {
+//
+//							private static final long serialVersionUID = 1L;
+//
+//							@Override
+//							public Tuple2<Long, Tuple2<String, Row>> call(
+//									Tuple2<String, Tuple2<String, Row>> tuple)
+//									throws Exception {
+//								long userid = Long.valueOf(tuple._1.split("_")[1]);
+//								return new Tuple2<Long, Tuple2<String, Row>>(userid, tuple._2);
+//							}
+//
+//						});
+//		//       alaya35-Ar-34-5   joinedRDD2
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD2 = commonRDD. join(userid2InfoRDD);
+//		//       alaya35-Ar-34-6  合并
+//		JavaPairRDD<Long, Tuple2<String, Row>> joinedRDD = joinedRDD1. union(joinedRDD2);
+//
+//		JavaPairRDD<String, String> sessionid2FullAggrInfoRDD = joinedRDD.mapToPair(
+//
+//				new PairFunction<Tuple2<Long,Tuple2<String,Row>>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(
+//							Tuple2<Long, Tuple2<String, Row>> tuple)
+//							throws Exception {
+//						String partAggrInfo = tuple._2._1;
+//						Row userInfoRow = tuple._2._2;
+//
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//
+//				});
+
+
+
+		/**
+		 *        alaya35-Ar-35  使用随机数和扩容表进行join
+		 *1、选择一个RDD，要用flatMap，进行扩容，将每条数据，映射为多条数据，每个映射出来的数据，都带了一个n以内的随机数，通常来说，会选择10。
+
+		 *2、将另外一个RDD，做普通的map映射操作，每条数据，都打上一个10以内的随机数。
+
+		 *3、最后，将两个处理后的RDD，进行join操作。
+		 */
+		//       alaya35-Ar-35-1选择一个RDD，要用flatMap，进行扩容，将每条数据，映射为多条数据，每个映射出来的数据，都带了一个n以内的随机数，通常来说，会选择10。
+//		JavaPairRDD<String, Row> expandedRDD = userid2InfoRDD. flatMapToPair(
+//
+//				new PairFlatMapFunction<Tuple2<Long,Row>, String, Row>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Iterable<Tuple2<String, Row>> call(Tuple2<Long, Row> tuple)
+//							throws Exception {
+//						List<Tuple2<String, Row>> list = new ArrayList<Tuple2<String, Row>>();
+//
+//						for(int i = 0; i < 10; i++) {
+//							list.add(new Tuple2<String, Row>(0 + "_" + tuple._1, tuple._2));
+//						}
+//
+//						return list;
+//					}
+//
+//				});
+//		//       alaya35-Ar-35-2  将另外一个RDD，做普通的map映射操作，每条数据，都打上一个10以内的随机数。
+//		JavaPairRDD<String, String> mappedRDD = userid2PartAggrInfoRDD. mapToPair(
+//
+//				new PairFunction<Tuple2<Long,String>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(Tuple2<Long, String> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(10);
+//						return new Tuple2<String, String>(prefix + "_" + tuple._1, tuple._2);
+//					}
+//
+//				});
+//		//       alaya35-Ar-35-3 最后，将两个处理后的RDD，进行join操作。
+//		JavaPairRDD<String, Tuple2<String, Row>> joinedRDD = mappedRDD. join(expandedRDD);
+//
+//		JavaPairRDD<String, String> finalRDD = joinedRDD.mapToPair(
+//
+//				new PairFunction<Tuple2<String,Tuple2<String,Row>>, String, String>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, String> call(
+//							Tuple2<String, Tuple2<String, Row>> tuple)
+//							throws Exception {
+//						String partAggrInfo = tuple._2._1;
+//						Row userInfoRow = tuple._2._2;
+//
+//						String sessionid = StringUtils.getFieldFromConcatString(
+//								partAggrInfo, "\\|", Constants.FIELD_SESSION_ID);
+//
+//						int age = userInfoRow.getInt(3);
+//						String professional = userInfoRow.getString(4);
+//						String city = userInfoRow.getString(5);
+//						String sex = userInfoRow.getString(6);
+//
+//						String fullAggrInfo = partAggrInfo + "|"
+//								+ Constants.FIELD_AGE + "=" + age + "|"
+//								+ Constants.FIELD_PROFESSIONAL + "=" + professional + "|"
+//								+ Constants.FIELD_CITY + "=" + city + "|"
+//								+ Constants.FIELD_SEX + "=" + sex;
+//
+//						return new Tuple2<String, String>(sessionid, fullAggrInfo);
+//					}
+//
+//				});
+
+
+
 
 //		int count = sessionid2FullAggrInfoRDD .toArray().size();
 //		System.out.println("sessionid2FullAggrInfoRDD:"+ count);
@@ -973,6 +1321,15 @@ public class UserVisitSessionAnalyzeSpark {
 		 */
 
 		// 得到每天每小时的session数量
+		/**       alaya35-Ar-31 数据倾斜解决方案之提高shuffle操作reduce并行度
+		 * 每天每小时的session数量的计算
+		 * 是有可能出现数据倾斜的吧，这个是没有疑问的
+		 * 比如说大部分小时，一般访问量也就10万；但是，中午12点的时候，高峰期，一个小时1000万
+		 * 这个时候，就会发生数据倾斜
+		 *
+		 * 我们就用这个countByKey操作，给大家演示第三种和第四种方案
+		 *
+		 */
 		Map<String, Object> countMap = time2sessionidRDD.countByKey();
 
 		//    1-4   //第二步，使用按时间比例随机抽取算法，计算出每天每小时要抽取session的索引
@@ -1630,6 +1987,13 @@ public class UserVisitSessionAnalyzeSpark {
 
 				});
 
+
+		/**
+		 * 计算各个品类的点击次数
+		 *
+		 * 如果某个品类点击了1000万次，其他品类都是10万次，那么也会数据倾斜
+		 *
+		 */
 		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = clickCategoryIdRDD.reduceByKey(
 
 				new Function2<Long, Long, Long>() {
@@ -1641,7 +2005,98 @@ public class UserVisitSessionAnalyzeSpark {
 						return v1 + v2;
 					}
 
-				});
+				} );
+
+		/**
+		 *         alaya35-Ar-31  数据倾斜解决方案之提高shuffle操作reduce并行度
+		 */
+
+//		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = clickCategoryIdRDD.reduceByKey(
+//
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//
+//				},
+//				1000);
+
+		/**
+		 *  		alaya35-Ar-32  使用随机key实现双重聚合
+		 */
+
+//		/**
+//		 * 第一步，给每个key打上一个随机数
+//		 */
+//		JavaPairRDD<String, Long> mappedClickCategoryIdRDD = clickCategoryIdRDD.mapToPair(
+//
+//				new PairFunction<Tuple2<Long,Long>, String, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<String, Long> call(Tuple2<Long, Long> tuple)
+//							throws Exception {
+//						Random random = new Random();
+//						int prefix = random.nextInt(10);
+//						return new Tuple2<String, Long>(prefix + "_" + tuple._1, tuple._2);
+//					}
+//
+//				});
+//
+//		/**
+//		 * 第二步，执行第一轮局部聚合
+//		 */
+//		JavaPairRDD<String, Long> firstAggrRDD = mappedClickCategoryIdRDD.reduceByKey(
+//
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//
+//				});
+//
+//		/**
+//		 * 第三步，去除掉每个key的前缀
+//		 */
+//		JavaPairRDD<Long, Long> restoredRDD = firstAggrRDD.mapToPair(
+//
+//				new PairFunction<Tuple2<String,Long>, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Tuple2<Long, Long> call(Tuple2<String, Long> tuple)
+//							throws Exception {
+//						long categoryId = Long.valueOf(tuple._1.split("_")[1]);
+//						return new Tuple2<Long, Long>(categoryId, tuple._2);
+//					}
+//
+//				});
+//
+//		/**
+//		 * 第四步，最第二轮全局的聚合
+//		 */
+//		JavaPairRDD<Long, Long> clickCategoryId2CountRDD = restoredRDD.reduceByKey(
+//
+//				new Function2<Long, Long, Long>() {
+//
+//					private static final long serialVersionUID = 1L;
+//
+//					@Override
+//					public Long call(Long v1, Long v2) throws Exception {
+//						return v1 + v2;
+//					}
+//
+//				});
 
 		return clickCategoryId2CountRDD;
 	}
